@@ -1,353 +1,327 @@
+/*
+ * ChessMaster backend entry point.
+ */
+
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
-const http = require('http');
-const { WebSocketServer } = require('ws');
+
 const config = require('./config');
+const stockfishService = require('./stockfishService');
 const {
-  loadPuzzleSample,
-  getPuzzleSummary,
-  getRandomPuzzle,
-  getPuzzleById,
-} = require('./puzzleService');
-const {
+  analyzeGame,
   createGame,
-  getGame,
   joinGame,
   listGames,
-  recordCompletedGame,
+  recordCompletedGame: recordLocalGame,
   listCompletedGames,
   clearCompletedGames,
 } = require('./gameService');
+const puzzleService = require('./puzzleService');
 const {
-  getBestMove: getStockfishBestMove,
-  analyzeGame: analyzeStockfishGame,
-} = require('./stockfishService');
-const {
-  createUser,
-  findUserByUsername,
-  findUserByEmail,
-  findUserById,
-  verifyPassword,
-  mapUserRow,
-  updateUserRatings,
-} = require('./userService');
-const { signAccessToken, parseAuthorizationHeader, verifyAccessToken } = require('./authService');
-const {
-  recordCompletedGame: persistGame,
-  listGamesForUser,
+  recordCompletedGame: recordGame,
   clearGamesForUser,
+  listGamesForUser,
 } = require('./gameStore');
 const {
   recordPuzzleAttempt,
   listPuzzleHistory,
   clearPuzzleHistory,
 } = require('./puzzleHistoryStore');
+const {
+  createUser,
+  findUserByUsername,
+  findUserByEmail,
+  findUserById,
+  verifyPassword,
+  updateUserRatings,
+  mapUserRow,
+} = require('./userService');
+const {
+  signAccessToken,
+  verifyAccessToken,
+  parseAuthorizationHeader,
+} = require('./authService');
 
-async function bootstrap() {
-  const app = express();
-  const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+const app = express();
+const server = http.createServer(app);
 
-  app.use(express.json());
-  app.use(
-    cors({
-      origin: (origin, callback) => {
-        if (!origin || config.allowCorsOrigins.includes('*')) {
-          return callback(null, true);
-        }
-        if (config.allowCorsOrigins.includes(origin)) {
-          return callback(null, true);
-        }
-        return callback(new Error('Not allowed by CORS'));
-      },
-    })
-  );
+const allowOrigins = config.allowCorsOrigins;
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowOrigins.includes('*') || allowOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+};
 
-  app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '2mb' }));
 
-  function authenticate(req, res, next) {
-    try {
-      const token = parseAuthorizationHeader(req.headers.authorization || '');
-      if (!token) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-      const payload = verifyAccessToken(token);
-      req.user = { id: payload.sub };
-      return next();
-    } catch (err) {
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'ChessMaster backend running' });
+});
+
+app.get('/puzzles/random', async (req, res) => {
+  try {
+    const { ratingMin, ratingMax, theme } = req.query || {};
+    const puzzle = await puzzleService.getRandomPuzzle({ ratingMin, ratingMax, theme });
+    res.json(puzzle);
+  } catch (err) {
+    const status = err?.message?.includes('No puzzle found') ? 404 : 500;
+    res.status(status).json({ error: err.message || 'Unable to fetch puzzle' });
+  }
+});
+
+app.get('/puzzles/:id', async (req, res) => {
+  try {
+    const puzzle = await puzzleService.getPuzzleById(req.params.id);
+    res.json(puzzle);
+  } catch (err) {
+    const status = err?.message?.includes('not found') ? 404 : 500;
+    res.status(status).json({ error: err.message || 'Unable to fetch puzzle' });
+  }
+});
+
+app.post('/games', (req, res) => {
+  try {
+    const game = createGame(req.body || {});
+    res.status(201).json(game);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/games', (req, res) => {
+  res.json(listGames());
+});
+
+app.get('/games/:id', (req, res) => {
+  try {
+    const game = joinGame(req.params.id, req.body || {});
+    res.json(game);
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+app.post('/games/:id/join', (req, res) => {
+  try {
+    const player = req.body || {};
+    const game = joinGame(req.params.id, player);
+    res.json(game);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/games/completed', (req, res) => {
+  res.json(listCompletedGames());
+});
+
+app.post('/games/completed', (req, res) => {
+  try {
+    const record = recordLocalGame(req.body || {});
+    res.status(201).json(record);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/games/completed', (req, res) => {
+  clearCompletedGames();
+  res.status(204).end();
+});
+
+app.post('/engines/stockfish/move', async (req, res) => {
+  try {
+    const { fen, moves, movetime, depth, skillLevel, timeoutMs, multiPv } = req.body || {};
+    const data = await stockfishService.getBestMove({
+      fen,
+      moves,
+      movetime,
+      depth,
+      skillLevel,
+      timeoutMs,
+      multiPv,
+    });
+    res.json(data);
+  } catch (err) {
+    const status = err?.message === 'FEN is required to request a Stockfish move.' ? 400 : 500;
+    res.status(status).json({ error: err.message || 'Stockfish failed to compute move' });
+  }
+});
+
+app.post('/engines/stockfish/analyze', async (req, res) => {
+  try {
+    const {
+      pgn,
+      depth,
+      movetime,
+      skillLevel,
+      timeoutMs,
+      multiPv,
+      maxPlies,
+      thresholds,
+    } = req.body || {};
+    const data = await stockfishService.analyzeGame({
+      pgn,
+      depth,
+      movetime,
+      skillLevel,
+      timeoutMs,
+      multiPv,
+      maxPlies,
+      thresholds,
+    });
+    res.json({ ok: true, data });
+  } catch (err) {
+    const status = err?.message === 'PGN is required for analysis.' ? 400 : 500;
+    res.status(status).json({ error: err.message || 'Stockfish analysis failed' });
+  }
+});
+
+app.post('/auth/signup', async (req, res) => {
+  try {
+    const { username, email, password } = req.body || {};
+    const user = await createUser({ username, email, password });
+    const token = signAccessToken({ userId: user.id });
+    res.status(201).json({ user, token });
+  } catch (err) {
+    res.status(400).json({ error: err.message || 'Unable to create user' });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { username, email, password } = req.body || {};
+    let userRow = null;
+    if (username) {
+      userRow = await findUserByUsername(username);
+    }
+    if (!userRow && email) {
+      userRow = await findUserByEmail(email);
+    }
+    if (!userRow || !verifyPassword(userRow, password)) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const user = mapUserRow(userRow);
+    const token = signAccessToken({ userId: user.id });
+    return res.json({ user, token });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || 'Unable to login' });
+  }
+});
+
+app.post('/auth/token/verify', (req, res) => {
+  try {
+    const { token } = req.body || {};
+    const payload = verifyAccessToken(token);
+    res.json({ ok: true, payload });
+  } catch (err) {
+    res.status(401).json({ error: err.message || 'Invalid token' });
+  }
+});
+
+function authenticate(req, res, next) {
+  try {
+    const token = parseAuthorizationHeader(req.headers.authorization);
+    if (!token) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
+    const payload = verifyAccessToken(token);
+    req.user = { id: payload.sub };
+    return next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
+}
 
-  app.post('/auth/signup', (req, res) => {
-    try {
-      const { username, email, password } = req.body || {};
-      const user = createUser({ username, email, password });
-      const token = signAccessToken({ userId: user.id });
-      res.status(201).json({ user, token });
-    } catch (err) {
-      res.status(400).json({ error: err.message || 'Unable to create user' });
-    }
-  });
+app.use('/users/:id', authenticate);
 
-  app.post('/auth/login', (req, res) => {
-    try {
-      const { username, email, password } = req.body || {};
-      let userRow = null;
-      if (username) {
-        userRow = findUserByUsername(username);
-      }
-      if (!userRow && email) {
-        userRow = findUserByEmail(email);
-      }
-      if (!userRow || !verifyPassword(userRow, password)) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
-      const user = mapUserRow(userRow);
-      const token = signAccessToken({ userId: user.id });
-      return res.json({ user, token });
-    } catch (err) {
-      return res.status(400).json({ error: err.message || 'Unable to login' });
-    }
-  });
-
-  app.get('/games/completed', (req, res) => {
-    res.json(listCompletedGames());
-  });
-
-  app.post('/games/:id/complete', (req, res) => {
-    const { result, reason, winner, moves, metadata } = req.body || {};
-    const existing = getGame(req.params.id);
-    const record = recordCompletedGame({
-      id: req.params.id,
-      createdAt: existing?.createdAt,
-      players: existing?.players,
-      timeControl: existing?.timeControl,
-      moves: moves || existing?.moves,
-      result,
-      reason,
-      winner,
-      metadata: {
-        ...(existing?.metadata || {}),
-        ...(typeof metadata === 'object' && metadata !== null ? metadata : {}),
-      },
-      status: 'completed',
-    });
-    res.status(201).json(record);
-  });
-
-  app.delete('/games/completed', (req, res) => {
-    clearCompletedGames();
-    res.status(204).send();
-  });
-
-  app.get('/puzzles/summary', (req, res) => {
-    res.json(getPuzzleSummary());
-  });
-
-  app.get('/puzzles/random', (req, res) => {
-    try {
-      const { ratingMin, ratingMax, theme } = req.query;
-      const puzzle = getRandomPuzzle({
-        ratingMin: ratingMin ? Number(ratingMin) : undefined,
-        ratingMax: ratingMax ? Number(ratingMax) : undefined,
-        theme,
-      });
-      res.json(puzzle);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.get('/puzzles/:id', (req, res) => {
-    const puzzle = getPuzzleById(req.params.id);
-    if (!puzzle) {
-      return res.status(404).json({ error: 'Puzzle not found' });
-    }
-    return res.json(puzzle);
-  });
-
-  app.post('/engines/stockfish/move', async (req, res) => {
-    try {
-      const {
-        fen,
-        moves = [],
-        movetime,
-        depth,
-        skillLevel,
-        timeoutMs,
-        multiPv,
-      } = req.body || {};
-      if (!fen || typeof fen !== 'string') {
-        return res.status(400).json({ error: 'FEN is required.' });
-      }
-      const result = await getStockfishBestMove({
-        fen,
-        moves,
-        movetime,
-        depth,
-        skillLevel,
-        timeoutMs,
-        multiPv,
-      });
-      return res.json(result);
-    } catch (err) {
-      console.error('Stockfish move error:', err.message || err);
-      return res.status(500).json({ error: err.message || 'Engine failure' });
-    }
-  });
-
-  app.post('/engines/stockfish/analyze', async (req, res) => {
-    try {
-      const {
-        pgn,
-        depth,
-        movetime,
-        skillLevel,
-        timeoutMs,
-        multiPv,
-        maxPlies,
-        thresholds,
-      } = req.body || {};
-      if (!pgn || typeof pgn !== 'string') {
-        return res.status(400).json({ error: 'PGN is required.' });
-      }
-      const result = await analyzeStockfishGame({
-        pgn,
-        depth,
-        movetime,
-        skillLevel,
-        timeoutMs,
-        multiPv,
-        maxPlies,
-        thresholds,
-      });
-      return res.json(result);
-    } catch (err) {
-      console.error('Stockfish analysis error:', err.message || err);
-      return res.status(500).json({ error: err.message || 'Analysis failure' });
-    }
-  });
-
-  app.post('/games', (req, res) => {
-    const { timeControl, metadata } = req.body || {};
-    const game = createGame({ timeControl, metadata });
-    res.status(201).json(game);
-  });
-
-  app.get('/games', (req, res) => {
-    res.json(listGames());
-  });
-
-  app.get('/games/:id', (req, res) => {
-    const game = getGame(req.params.id);
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
-    return res.json(game);
-  });
-
-  app.post('/games/:id/join', (req, res) => {
-    try {
-      const player = req.body || {};
-      const game = joinGame(req.params.id, player);
-      res.json(game);
-    } catch (err) {
-      res.status(400).json({ error: err.message });
-    }
-  });
-
-  app.use('/users/:id', authenticate);
-
-  app.get('/users/:id', (req, res) => {
-    if (req.params.id !== req.user.id) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    const user = findUserById(req.user.id);
+app.get('/users/:id', async (req, res) => {
+  if (req.params.id !== req.user.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  try {
+    const user = await findUserById(req.user.id);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
     return res.json(user);
-  });
-
-  app.get('/users/:id/history', (req, res) => {
-    if (req.params.id !== req.user.id) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    const games = listGamesForUser(req.user.id, { limit: 200 });
-    const puzzles = listPuzzleHistory(req.user.id, { limit: 500 });
-    res.json({ games, puzzles });
-  });
-
-  app.post('/users/:id/history', (req, res) => {
-    if (req.params.id !== req.user.id) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    try {
-      const { type, payload = {} } = req.body || {};
-      if (type === 'game') {
-        if (payload.clear) {
-          clearGamesForUser(req.user.id);
-          return res.status(200).json({ type: 'game', status: 'cleared' });
-        }
-        const record = persistGame({ userId: req.user.id, ...payload });
-        return res.status(201).json({ type: 'game', record });
-      }
-      if (type === 'puzzle') {
-        if (payload.clear) {
-          clearPuzzleHistory(req.user.id);
-          if (typeof payload.rating === 'number' && typeof payload.streak === 'number') {
-            updateUserRatings({ userId: req.user.id, rating: payload.rating, streak: payload.streak });
-          }
-          return res.status(200).json({ type: 'puzzle', status: 'cleared' });
-        }
-        if (!payload.puzzleId) {
-          return res.status(400).json({ error: 'puzzleId is required for puzzle history entries' });
-        }
-        recordPuzzleAttempt({
-          userId: req.user.id,
-          puzzleId: payload.puzzleId,
-          solved: !!payload.solved,
-          streakDelta: Number.isFinite(payload.streakDelta) ? payload.streakDelta : 0,
-          ratingDelta: Number.isFinite(payload.ratingDelta) ? payload.ratingDelta : 0,
-          ratingAfter: Number.isFinite(payload.ratingAfter) ? payload.ratingAfter : (Number.isFinite(payload.rating) ? payload.rating : null),
-          attemptedAt: payload.attemptedAt || new Date().toISOString(),
-        });
-        if (typeof payload.rating === 'number' && typeof payload.streak === 'number') {
-          updateUserRatings({ userId: req.user.id, rating: payload.rating, streak: payload.streak });
-        }
-        return res.status(201).json({ type: 'puzzle', status: 'ok' });
-      }
-      return res.status(400).json({ error: 'Invalid history type' });
-    } catch (err) {
-      return res.status(400).json({ error: err.message || 'Unable to record history' });
-    }
-  });
-
-  wss.on('connection', (socket) => {
-    socket.on('message', (message) => {
-      // TODO: Add game-specific dispatch
-      socket.send(message);
-    });
-  });
-
-  server.listen(config.port, async () => {
-    console.log(`Server listening on port ${config.port}`);
-    try {
-      await loadPuzzleSample({
-        filePath: config.puzzleCsvPath,
-        sampleSize: config.puzzleSampleSize,
-      });
-      console.log('Puzzle sample loaded');
-    } catch (err) {
-      console.error('Failed to load puzzle sample:', err.message);
-    }
-  });
-}
-
-bootstrap().catch((err) => {
-  console.error('Failed to bootstrap server:', err);
-  process.exit(1);
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Unable to fetch user' });
+  }
 });
+
+app.get('/users/:id/history', async (req, res) => {
+  if (req.params.id !== req.user.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  try {
+    const [games, puzzles] = await Promise.all([
+      listGamesForUser(req.user.id, { limit: 200 }),
+      listPuzzleHistory(req.user.id, { limit: 500 }),
+    ]);
+    res.json({ games, puzzles });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Unable to fetch history' });
+  }
+});
+
+app.post('/users/:id/history', async (req, res) => {
+  if (req.params.id !== req.user.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  try {
+    const { type, payload = {} } = req.body || {};
+    if (type === 'game') {
+      if (payload.clear) {
+        await clearGamesForUser(req.user.id);
+        return res.status(200).json({ type: 'game', status: 'cleared' });
+      }
+      const record = await recordGame({ userId: req.user.id, ...payload });
+      return res.status(201).json({ type: 'game', record });
+    }
+    if (type === 'puzzle') {
+      if (payload.clear) {
+        await clearPuzzleHistory(req.user.id);
+        if (typeof payload.rating === 'number' && typeof payload.streak === 'number') {
+          await updateUserRatings({ userId: req.user.id, rating: payload.rating, streak: payload.streak });
+        }
+        return res.status(200).json({ type: 'puzzle', status: 'cleared' });
+      }
+      if (!payload.puzzleId) {
+        return res.status(400).json({ error: 'puzzleId is required for puzzle history entries' });
+      }
+      await recordPuzzleAttempt({
+        userId: req.user.id,
+        puzzleId: payload.puzzleId,
+        solved: !!payload.solved,
+        streakDelta: Number.isFinite(payload.streakDelta) ? payload.streakDelta : 0,
+        ratingDelta: Number.isFinite(payload.ratingDelta) ? payload.ratingDelta : 0,
+        ratingAfter: Number.isFinite(payload.ratingAfter) ? payload.ratingAfter : (Number.isFinite(payload.rating) ? payload.rating : null),
+        attemptedAt: payload.attemptedAt || new Date().toISOString(),
+      });
+      if (typeof payload.rating === 'number' && typeof payload.streak === 'number') {
+        await updateUserRatings({ userId: req.user.id, rating: payload.rating, streak: payload.streak });
+      }
+      return res.status(201).json({ type: 'puzzle', status: 'ok' });
+    }
+    return res.status(400).json({ error: 'Invalid history type' });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || 'Unable to record history' });
+  }
+});
+
+const PORT = config.port;
+server.listen(PORT, () => {
+  /* eslint-disable no-console */
+  console.log(`ChessMaster backend listening on port ${PORT}`);
+  /* eslint-enable no-console */
+});
+
+module.exports = { app, server };

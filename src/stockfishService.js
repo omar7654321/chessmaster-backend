@@ -1,4 +1,6 @@
 const { spawn } = require('child_process');
+const fs = require('fs');
+const readline = require('readline');
 const { Chess } = require('chess.js');
 const config = require('./config');
 
@@ -8,7 +10,17 @@ const DEFAULT_SKILL_LEVEL = 10;
 
 function assertConfigured() {
   if (!config.stockfishPath) {
-    throw new Error('Stockfish path is not configured. Set STOCKFISH_PATH in the backend .env file.');
+    const candidates = (config.stockfishCandidates || []).join('\n - ');
+    throw new Error([
+      'Stockfish binary path could not be resolved.',
+      'Set STOCKFISH_PATH or ensure postinstall downloaded the engine.',
+      candidates ? `Paths tried:\n - ${candidates}` : '',
+    ].filter(Boolean).join('\n'));
+  }
+  try {
+    fs.accessSync(config.stockfishPath, fs.constants.X_OK);
+  } catch (err) {
+    throw new Error(`Stockfish binary not executable at ${config.stockfishPath}. ${err.message}`);
   }
 }
 
@@ -104,13 +116,75 @@ async function getBestMove({ fen, moves = [], movetime, depth, skillLevel, timeo
     throw new Error('FEN is required to request a Stockfish move.');
   }
 
+  let engine;
+  try {
+    engine = spawn(config.stockfishPath, [], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    throw new Error(`Unable to spawn Stockfish binary: ${err.message || err}`);
+  }
+
+  const rl = readline.createInterface({
+    input: engine.stdout,
+    crlfDelay: Infinity,
+  });
+
+  let stderrBuffer = '';
+  engine.stderr.on('data', (chunk) => {
+    stderrBuffer += chunk.toString();
+  });
+
+  let stdinFaulted = false;
+  if (engine.stdin) {
+    engine.stdin.on('error', (err) => {
+      if (err && err.code === 'EPIPE') {
+        stdinFaulted = true;
+        return;
+      }
+      console.warn('Stockfish stdin error:', err);
+      stdinFaulted = true;
+    });
+    engine.stdin.on('close', () => {
+      stdinFaulted = true;
+    });
+  }
+
+  const canWriteToEngine = () => (
+    !!engine.stdin
+    && !stdinFaulted
+    && !engine.stdin.destroyed
+    && !engine.stdin.writableEnded
+    && engine.stdin.writable
+  );
+
+  const sendCommand = (message) => {
+    const payload = Array.isArray(message) ? message.join(' ') : String(message);
+    if (!canWriteToEngine()) {
+      throw new Error('Stockfish stdin is not writable.');
+    }
+    try {
+      engine.stdin.write(`${payload}\n`);
+    } catch (err) {
+      if (err && err.code === 'EPIPE') {
+        stdinFaulted = true;
+        throw new Error('Stockfish stdin closed unexpectedly.');
+      }
+      throw err;
+    }
+  };
+
+  const terminateEngine = () => {
+    rl.removeAllListeners();
+    rl.close();
+    if (!engine.killed) {
+      engine.kill('SIGTERM');
+    }
+  };
+
   return new Promise((resolve, reject) => {
-    const engine = spawn(config.stockfishPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
     let resolved = false;
-    let stderrBuffer = '';
-    let stdoutBuffer = '';
     let rawOutput = '';
-    let stage = 'init';
     let evaluation = null;
     let bestDepth = null;
     let pv = [];
@@ -120,26 +194,36 @@ async function getBestMove({ fen, moves = [], movetime, depth, skillLevel, timeo
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
-        engine.kill();
+        cleanup();
         reject(new Error('Stockfish response timed out.'));
       }
     }, localTimeout);
 
     const cleanup = () => {
       clearTimeout(timer);
-      if (!engine.killed) {
-        engine.kill();
+      try {
+        if (canWriteToEngine()) {
+          sendCommand('quit');
+        }
+      } catch (err) {
+        // ignore
       }
+      terminateEngine();
     };
 
     const send = (command) => {
-      if (engine.stdin.writable) {
-        engine.stdin.write(`${command}\n`);
+      try {
+        sendCommand(command);
+      } catch (err) {
+        if (!resolved) {
+          resolved = true;
+          cleanup();
+          reject(err);
+        }
       }
     };
 
     const buildResult = (bestMove, ponder) => {
-      // Merge stream-captured lines with a raw parse to ensure we have the latest data
       const rawLines = parseMultiPvFromRaw(rawOutput);
       for (const [idx, data] of rawLines.entries()) {
         const existing = multiPvLines.get(idx) || {};
@@ -159,7 +243,7 @@ async function getBestMove({ fen, moves = [], movetime, depth, skillLevel, timeo
         depth: bestDepth,
         pv,
         raw: rawOutput,
-        stderr: stderrBuffer,
+        stderr: '',
       };
 
       if (!result.evaluation) {
@@ -210,17 +294,6 @@ async function getBestMove({ fen, moves = [], movetime, depth, skillLevel, timeo
       return result;
     };
 
-    engine.on('error', (err) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      reject(err);
-    });
-
-    engine.stderr.on('data', (chunk) => {
-      stderrBuffer += chunk.toString();
-    });
-
     const processInfoLine = (line) => {
       const mpvMatch = line.match(/\bmultipv\s+(\d+)/);
       const idx = mpvMatch ? Number.parseInt(mpvMatch[1], 10) : 1;
@@ -256,12 +329,15 @@ async function getBestMove({ fen, moves = [], movetime, depth, skillLevel, timeo
       multiPvLines.set(idx, entry);
     };
 
-    engine.stdout.on('data', (chunk) => {
-      const text = chunk.toString();
-      rawOutput += text;
-      stdoutBuffer += text;
+    let stage = 'uci';
 
-      if (stage === 'uci' && stdoutBuffer.includes('uciok')) {
+    const handleLine = (line) => {
+      if (!line) return;
+      rawOutput += `${line}\n`;
+      const trimmed = line.trim();
+      if (!trimmed) return;
+
+      if (stage === 'uci' && trimmed.includes('uciok')) {
         const clampedSkill = clampSkillLevel(skillLevel);
         send(`setoption name Skill Level value ${clampedSkill}`);
         if (clampedMultiPv > 1) {
@@ -269,11 +345,10 @@ async function getBestMove({ fen, moves = [], movetime, depth, skillLevel, timeo
         }
         send('isready');
         stage = 'isready';
-        stdoutBuffer = '';
         return;
       }
 
-      if (stage === 'isready' && stdoutBuffer.includes('readyok')) {
+      if (stage === 'isready' && trimmed.includes('readyok')) {
         const position = buildPositionCommand(fen, moves);
         send(position);
         if (typeof depth === 'number' && depth > 0) {
@@ -283,37 +358,49 @@ async function getBestMove({ fen, moves = [], movetime, depth, skillLevel, timeo
           send(`go movetime ${mt}`);
         }
         stage = 'go';
-        stdoutBuffer = '';
         return;
       }
 
       if (stage === 'go') {
-        const lines = stdoutBuffer.split(/\r?\n/);
-        stdoutBuffer = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          if (trimmed.startsWith('info ')) {
-            processInfoLine(trimmed);
-          } else if (trimmed.startsWith('bestmove')) {
-            const [, move, ponder] = trimmed.split(/\s+/);
-            resolved = true;
-            cleanup();
-            resolve(buildResult(move, ponder));
-            return;
-          }
+        if (trimmed.startsWith('info ')) {
+          processInfoLine(trimmed);
+        } else if (trimmed.startsWith('bestmove')) {
+          const parts = trimmed.split(/\s+/);
+          const bestMove = parts[1] || null;
+          const ponderMove = parts[3] === 'ponder' ? parts[4] : parts[2];
+          resolved = true;
+          cleanup();
+          resolve(buildResult(bestMove, ponderMove));
         }
+      }
+    };
+
+    rl.on('line', (line) => {
+      handleLine(line);
+    });
+
+    rl.on('close', () => {
+      if (!resolved) {
+        resolved = true;
+        cleanup();
+        reject(new Error('Stockfish engine closed unexpectedly.'));
       }
     });
 
+    engine.on('error', (err) => {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      reject(new Error(`Stockfish error: ${err.message || err}`));
+    });
+
     engine.on('exit', (code, signal) => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timer);
-        const baseError = new Error(`Stockfish terminated before responding (code=${code}, signal=${signal})`);
-        baseError.stderr = stderrBuffer;
-        reject(baseError);
-      }
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      const reason = code !== null ? `exit code ${code}` : `signal ${signal}`;
+      const stderrMsg = stderrBuffer ? `\nStderr:\n${stderrBuffer}` : '';
+      reject(new Error(`Stockfish exited prematurely (${reason}).${stderrMsg}`));
     });
 
     stage = 'uci';

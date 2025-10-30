@@ -1,116 +1,72 @@
-const fs = require('fs');
-const path = require('path');
-const csv = require('csv-parser');
+const puzzleRepository = require('./puzzleRepository');
 
-let puzzleSample = [];
-let lastLoadSummary = null;
+const DEFAULT_MIN_RATING = 0;
+const DEFAULT_MAX_RATING = 4000;
 
-function parseThemes(rawThemes = '') {
-  return rawThemes
-    .split(/[,\s]+/)
-    .map((t) => t.trim())
-    .filter(Boolean);
+function toInteger(value) {
+  if (value == null) return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
-function mapRowToPuzzle(row) {
-  return {
-    id: row.PuzzleId,
-    fen: row.FEN,
-    moves: row.Moves ? row.Moves.trim().split(/\s+/) : [],
-    rating: row.Rating ? Number(row.Rating) : null,
-    ratingDeviation: row.RatingDeviation ? Number(row.RatingDeviation) : null,
-    popularity: row.Popularity ? Number(row.Popularity) : null,
-    plays: row.NbPlays ? Number(row.NbPlays) : null,
-    themes: parseThemes(row.Themes),
-    gameUrl: row.GameUrl || null,
-    openingTags: parseThemes(row.OpeningTags || row.OpeningTags || ''),
-  };
-}
+function sanitizeRatingBounds(minRaw, maxRaw) {
+  const min = toInteger(minRaw);
+  const max = toInteger(maxRaw);
 
-async function loadPuzzleSample({ filePath, sampleSize = 1000 } = {}) {
-  if (!filePath) {
-    throw new Error('PUZZLE_CSV_PATH is not configured.');
+  if (min == null && max == null) {
+    return { ratingMin: DEFAULT_MIN_RATING, ratingMax: DEFAULT_MAX_RATING };
   }
 
-  const resolved = path.resolve(filePath);
-  if (!fs.existsSync(resolved)) {
-    throw new Error(`Puzzle CSV not found at ${resolved}`);
+  if (min == null) {
+    return {
+      ratingMin: DEFAULT_MIN_RATING,
+      ratingMax: max,
+    };
   }
 
-  return new Promise((resolve, reject) => {
-    const sample = [];
-    let processed = 0;
-
-    const stream = fs
-      .createReadStream(resolved)
-      .on('error', reject)
-      .pipe(csv())
-      .on('data', (row) => {
-        processed += 1;
-        const puzzle = mapRowToPuzzle(row);
-
-        if (sample.length < sampleSize) {
-          sample.push(puzzle);
-        } else {
-          const idx = Math.floor(Math.random() * processed);
-          if (idx < sampleSize) {
-            sample[idx] = puzzle;
-          }
-        }
-      })
-      .on('end', () => {
-        puzzleSample = sample;
-        lastLoadSummary = {
-          loadedAt: new Date().toISOString(),
-          sampleSize: sample.length,
-          processedRows: processed,
-          source: resolved,
-        };
-        resolve(puzzleSample);
-      });
-  });
-}
-
-function getPuzzleSummary() {
-  return {
-    count: puzzleSample.length,
-    lastLoad: lastLoadSummary,
-  };
-}
-
-function getRandomPuzzle(filters = {}) {
-  if (!puzzleSample.length) {
-    throw new Error('Puzzle sample is empty. Did you call loadPuzzleSample()?');
+  if (max == null) {
+    return {
+      ratingMin: min,
+      ratingMax: DEFAULT_MAX_RATING,
+    };
   }
 
-  const { ratingMin, ratingMax, theme } = filters;
+  if (min > max) {
+    return { ratingMin: max, ratingMax: min };
+  }
 
-  const filtered = puzzleSample.filter((puzzle) => {
-    if (ratingMin && puzzle.rating !== null && puzzle.rating < ratingMin) {
-      return false;
-    }
-    if (ratingMax && puzzle.rating !== null && puzzle.rating > ratingMax) {
-      return false;
-    }
-    if (theme && theme.length) {
-      return puzzle.themes.includes(theme);
-    }
-    return true;
+  return { ratingMin: min, ratingMax: max };
+}
+
+async function getRandomPuzzle({ ratingMin, ratingMax, theme } = {}) {
+  const bounds = sanitizeRatingBounds(ratingMin, ratingMax);
+  const normalizedTheme = typeof theme === 'string' && theme.trim().length ? theme.trim() : null;
+
+  const puzzle = await puzzleRepository.getRandomPuzzle({
+    ...bounds,
+    theme: normalizedTheme,
   });
 
-  const pool = filtered.length ? filtered : puzzleSample;
-  const choice = pool[Math.floor(Math.random() * pool.length)];
-  return choice;
+  if (!puzzle) {
+    throw new Error('No puzzle found for the provided filters.');
+  }
+
+  return puzzle;
 }
 
-function getPuzzleById(id) {
-  if (!id) return null;
-  return puzzleSample.find((p) => p.id === id) || null;
+async function getPuzzleById(id) {
+  if (!id) {
+    throw new Error('Puzzle id is required.');
+  }
+
+  const puzzle = await puzzleRepository.getPuzzleById(String(id).trim());
+  if (!puzzle) {
+    throw new Error(`Puzzle ${id} not found.`);
+  }
+  return puzzle;
 }
 
 module.exports = {
-  loadPuzzleSample,
-  getPuzzleSummary,
   getRandomPuzzle,
   getPuzzleById,
 };

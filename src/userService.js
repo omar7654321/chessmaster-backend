@@ -1,7 +1,6 @@
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
-const { getDb } = require('./db');
-const config = require('./config');
+const { query } = require('./db');
 
 function mapUserRow(row) {
   if (!row) return null;
@@ -15,56 +14,55 @@ function mapUserRow(row) {
   };
 }
 
-function createUser({ username, email, password }) {
+async function createUser({ username, email, password }) {
   if (!username || !email || !password) {
     throw new Error('username, email, and password are required');
   }
 
-  const db = getDb();
-  const existingStmt = db.prepare('SELECT id FROM users WHERE username = ? OR email = ?');
-  const existing = existingStmt.get(username, email);
-  if (existing) {
+  const existing = await query(
+    'SELECT id FROM users WHERE username = $1 OR email = $2 LIMIT 1',
+    [username, email]
+  );
+  if (existing.rows.length) {
     throw new Error('User already exists with that username or email');
   }
 
   const id = uuidv4();
   const passwordHash = bcrypt.hashSync(password, 10);
   const now = new Date().toISOString();
-  const insert = db.prepare(`
-    INSERT INTO users (id, username, email, password_hash, rating, streak, created_at)
-    VALUES (?, ?, ?, ?, 1500, 0, ?)
-  `);
-  insert.run(id, username, email, passwordHash, now);
 
-  return mapUserRow({
-    id,
-    username,
-    email,
-    rating: 1500,
-    streak: 0,
-    created_at: now,
-  });
+  try {
+    const result = await query(
+      `INSERT INTO users (id, username, email, password_hash, rating, streak, created_at)
+       VALUES ($1, $2, $3, $4, 1500, 0, $5)
+       RETURNING *`,
+      [id, username, email, passwordHash, now]
+    );
+    return mapUserRow(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') {
+      throw new Error('User already exists with that username or email');
+    }
+    throw err;
+  }
 }
 
-function findUserByUsername(username) {
-  const db = getDb();
-  const stmt = db.prepare('SELECT * FROM users WHERE username = ?');
-  const row = stmt.get(username);
-  return row ? { ...row } : null;
+async function findUserByUsername(username) {
+  if (!username) return null;
+  const result = await query('SELECT * FROM users WHERE username = $1 LIMIT 1', [username]);
+  return result.rows[0] ? { ...result.rows[0] } : null;
 }
 
-function findUserByEmail(email) {
-  const db = getDb();
-  const stmt = db.prepare('SELECT * FROM users WHERE email = ?');
-  const row = stmt.get(email);
-  return row ? { ...row } : null;
+async function findUserByEmail(email) {
+  if (!email) return null;
+  const result = await query('SELECT * FROM users WHERE email = $1 LIMIT 1', [email]);
+  return result.rows[0] ? { ...result.rows[0] } : null;
 }
 
-function findUserById(id) {
-  const db = getDb();
-  const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
-  const row = stmt.get(id);
-  return row ? mapUserRow(row) : null;
+async function findUserById(id) {
+  if (!id) return null;
+  const result = await query('SELECT * FROM users WHERE id = $1 LIMIT 1', [id]);
+  return result.rows[0] ? mapUserRow(result.rows[0]) : null;
 }
 
 function verifyPassword(userRow, password) {
@@ -72,10 +70,9 @@ function verifyPassword(userRow, password) {
   return bcrypt.compareSync(password, userRow.password_hash);
 }
 
-function updateUserRatings({ userId, rating, streak }) {
-  const db = getDb();
-  const stmt = db.prepare('UPDATE users SET rating = ?, streak = ? WHERE id = ?');
-  stmt.run(rating, streak, userId);
+async function updateUserRatings({ userId, rating, streak }) {
+  if (!userId) return;
+  await query('UPDATE users SET rating = $1, streak = $2 WHERE id = $3', [rating, streak, userId]);
 }
 
 module.exports = {

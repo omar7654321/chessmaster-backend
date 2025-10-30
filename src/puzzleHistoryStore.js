@@ -1,59 +1,69 @@
-const { getDb } = require('./db');
+const { query } = require('./db');
 
-function recordPuzzleAttempt({
+async function recordPuzzleAttempt({
   userId,
   puzzleId,
   solved,
   streakDelta,
   ratingDelta,
   ratingAfter,
-  attemptedAt = new Date().toISOString(),
+  attemptedAt,
 }) {
-  if (!userId || !puzzleId) {
-    throw new Error('userId and puzzleId are required');
+  if (!userId) {
+    throw new Error('userId is required to record puzzle history');
   }
-  const db = getDb();
-  const stmt = db.prepare(`
-    INSERT INTO puzzle_history (
+  if (!puzzleId) {
+    throw new Error('puzzleId is required to record puzzle history');
+  }
+
+  await query(
+    `INSERT INTO puzzle_history (
       user_id,
       puzzle_id,
       solved,
       streak_delta,
       rating_delta,
-      attempted_at,
-      rating_after
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const normalizedRatingAfter = Number.isFinite(ratingAfter) ? Math.round(ratingAfter) : null;
-  stmt.run(userId, puzzleId, solved ? 1 : 0, streakDelta, ratingDelta, attemptedAt, normalizedRatingAfter);
+      rating_after,
+      attempted_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7)`
+      ,
+    [
+      userId,
+      puzzleId,
+      solved ? 1 : 0,
+      Number.isFinite(streakDelta) ? streakDelta : 0,
+      Number.isFinite(ratingDelta) ? ratingDelta : 0,
+      Number.isFinite(ratingAfter) ? ratingAfter : null,
+      attemptedAt || new Date().toISOString(),
+    ]
+  );
 }
 
-function listPuzzleHistory(userId, { limit = 200, offset = 0 } = {}) {
-  const db = getDb();
-  const stmt = db.prepare(`
-    SELECT * FROM puzzle_history
-    WHERE user_id = ?
-    ORDER BY attempted_at DESC
-    LIMIT ? OFFSET ?
-  `);
-  const rows = stmt.all(userId, limit, offset);
-  return rows.map((row) => ({
-    id: row.id,
-    userId: row.user_id,
+async function listPuzzleHistory(userId, { limit = 100 } = {}) {
+  if (!userId) return [];
+  const result = await query(
+    `SELECT puzzle_id, solved, streak_delta, rating_delta, rating_after, attempted_at
+     FROM puzzle_history
+     WHERE user_id = $1
+     ORDER BY attempted_at DESC
+     LIMIT $2`,
+    [userId, Math.max(1, Math.min(500, Number(limit) || 100))]
+  );
+
+  return result.rows.map((row) => ({
     puzzleId: row.puzzle_id,
     solved: !!row.solved,
     streakDelta: row.streak_delta,
     ratingDelta: row.rating_delta,
-    attemptedAt: row.attempted_at,
     ratingAfter: row.rating_after,
+    attemptedAt: row.attempted_at,
   }));
 }
 
-function clearPuzzleHistory(userId) {
+async function clearPuzzleHistory(userId) {
   if (!userId) return;
-  const db = getDb();
-  const stmt = db.prepare('DELETE FROM puzzle_history WHERE user_id = ?');
-  stmt.run(userId);
+  await query('DELETE FROM puzzle_history WHERE user_id = $1', [userId]);
 }
 
 module.exports = {
