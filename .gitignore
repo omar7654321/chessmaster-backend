@@ -1,0 +1,6 @@
+node_modules/
+data/lichess_db_puzzle.csv
+data/*.db
+.env
+bin/stockfish/*
+!bin/stockfish/README.md

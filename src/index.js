@@ -8,6 +8,7 @@ const cors = require('cors');
 
 const config = require('./config');
 const stockfishService = require('./stockfishService');
+const { initOnlinePlayServer } = require('./onlinePlayServer');
 const {
   analyzeGame,
   createGame,
@@ -323,5 +324,7 @@ server.listen(PORT, () => {
   console.log(`ChessMaster backend listening on port ${PORT}`);
   /* eslint-enable no-console */
 });
+
+initOnlinePlayServer(server);
 
 module.exports = { app, server };
