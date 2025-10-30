@@ -4,6 +4,7 @@ const path = require('path');
 const https = require('https');
 const os = require('os');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 const unzipper = require('unzipper');
 
 const BIN_DIR = path.resolve(__dirname, '..', 'bin', 'stockfish');
@@ -56,18 +57,22 @@ const RELEASES = {
   linux: {
     x64: {
       targets: [
-        'https://github.com/official-stockfish/Stockfish/releases/download/sf_16.1/stockfish-16.1-linux-x86-64.zip',
-        'https://stockfishchess.org/files/stockfish-16.1-linux-x86-64.zip',
+        'https://github.com/official-stockfish/Stockfish/releases/download/sf_17.1/stockfish_17.1_linux_x64.zip',
+        'https://github.com/official-stockfish/Stockfish/releases/download/sf_17.1/stockfish-ubuntu-x86-64.tar',
+        'https://github.com/official-stockfish/Stockfish/releases/download/sf_17/stockfish-ubuntu-x86-64.tar',
+        'https://stockfishchess.org/files/stockfish_17.1_linux_x64.zip',
+        'https://stockfishchess.org/files/stockfish-ubuntu-x86-64.tar',
       ],
-      binaryPattern: /stockfish[\\/]+stockfish-linux-x86-64.*$/,
+      binaryPattern: /stockfish[\\/].*(linux|ubuntu).*x86[-_]?64(?:[\\/]+stockfish)?$/i,
       target: 'stockfish',
     },
     arm64: {
       targets: [
-        'https://github.com/official-stockfish/Stockfish/releases/download/sf_16.1/stockfish-16.1-linux-armv8.zip',
-        'https://stockfishchess.org/files/stockfish-16.1-linux-armv8.zip',
+        'https://github.com/official-stockfish/Stockfish/releases/download/sf_17.1/stockfish-ubuntu-arm64.tar',
+        'https://github.com/official-stockfish/Stockfish/releases/download/sf_17/stockfish-ubuntu-arm64.tar',
+        'https://stockfishchess.org/files/stockfish-ubuntu-arm64.tar',
       ],
-      binaryPattern: /stockfish[\\/]+stockfish-linux-armv8.*$/,
+      binaryPattern: /stockfish[\\/].*(linux|ubuntu).*arm(?:v?8)?(?:[\\/]+stockfish)?$/i,
       target: 'stockfish',
     },
   },
@@ -140,6 +145,30 @@ async function unzip(zipPath, destDir) {
     .promise();
 }
 
+async function extractArchive(archivePath, destDir) {
+  const lower = archivePath.toLowerCase();
+  if (lower.endsWith('.zip')) {
+    await unzip(archivePath, destDir);
+    return;
+  }
+
+  if (/(\.tar(\.(gz|xz|bz2|zst))?)$/i.test(lower)) {
+    ensureDir(destDir);
+    await new Promise((resolve, reject) => {
+      execFile('tar', ['-xf', archivePath, '-C', destDir], (err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve();
+      });
+    });
+    return;
+  }
+
+  throw new Error(`Unsupported archive format for ${archivePath}`);
+}
+
 function cleanupTemp() {
   try {
     fs.rmSync(TMP_DIR, { recursive: true, force: true });
@@ -189,9 +218,9 @@ async function downloadStockfish() {
       log(`Downloaded ${targetUrl} (sha256=${sha256})`);
 
       log(`Extracting ${archivePath}`);
-      await unzip(archivePath, extractDir);
+      await extractArchive(archivePath, extractDir);
 
-      sourceBinary = findBinary(extractDir, platformConfig.binaryPattern) || '';
+      sourceBinary = findBinary(extractDir, platformConfig.binaryPattern, platformConfig.target) || '';
       if (!sourceBinary) {
         throw new Error('Expected Stockfish binary not found in extracted archive.');
       }
@@ -219,9 +248,22 @@ async function downloadStockfish() {
   log(`Stockfish binary installed to ${targetBinary}`);
 }
 
-function findBinary(root, pattern) {
+function findBinary(root, pattern, fallbackName) {
   const entries = traverse(root);
-  return entries.find((entry) => pattern.test(entry.replace(/\\/g, '/')));
+  const normalisedEntries = entries.map((entry) => entry.replace(/\\/g, '/'));
+  if (pattern) {
+    const matched = normalisedEntries.find((entry) => pattern.test(entry));
+    if (matched) {
+      return matched;
+    }
+  }
+  if (fallbackName) {
+    const fallback = entries.find((entry) => path.basename(entry).toLowerCase() === fallbackName.toLowerCase());
+    if (fallback) {
+      return fallback;
+    }
+  }
+  return null;
 }
 
 function traverse(dir) {
