@@ -373,6 +373,8 @@ function handleMove(ws, payload = {}) {
     return;
   }
 
+  log.info('Move request', { gameId, playerId: player.playerId, uci });
+
   const moverColor = player.color;
   const chess = lobby.chess;
   const turn = chess.turn() === 'w' ? 'white' : 'black';
@@ -393,6 +395,7 @@ function handleMove(ws, payload = {}) {
   }
 
   if (!moveResult) {
+    log.warn('Illegal move rejected', { gameId, playerId: player.playerId, uci });
     safeSend(ws, { type: 'error', code: 'ILLEGAL_MOVE', msg: 'Illegal move' });
     return;
   }
@@ -406,6 +409,14 @@ function handleMove(ws, payload = {}) {
 
   const fenAfter = chess.fen();
   const nextTurn = chess.turn() === 'w' ? 'white' : 'black';
+
+  log.info('Move applied', {
+    gameId,
+    playerId: player.playerId,
+    uci,
+    fenAfter,
+    nextTurn,
+  });
 
   broadcastToLobby(lobby, {
     type: 'move',
