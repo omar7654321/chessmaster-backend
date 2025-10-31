@@ -322,13 +322,26 @@ function resolveUciFromMove(move) {
   return `${move.from}${move.to}${move.promotion ? move.promotion : ''}`;
 }
 
-function determineGameOverReason(chessInstance) {
-  if (chessInstance.isCheckmate()) return 'checkmate';
-  if (chessInstance.isStalemate()) return 'stalemate';
-  if (chessInstance.isThreefoldRepetition()) return 'threefold';
-  if (chessInstance.isInsufficientMaterial()) return 'insufficient_material';
-  if (chessInstance.isDraw()) return 'draw';
-  return 'completed';
+function determineGameOutcome(chessInstance, moverColor) {
+  if (chessInstance.isCheckmate()) {
+    return {
+      result: moverColor === 'white' ? '1-0' : '0-1',
+      reason: 'checkmate',
+    };
+  }
+  if (chessInstance.isStalemate()) {
+    return { result: '1/2-1/2', reason: 'stalemate' };
+  }
+  if (chessInstance.isThreefoldRepetition()) {
+    return { result: '1/2-1/2', reason: 'threefold' };
+  }
+  if (chessInstance.isInsufficientMaterial()) {
+    return { result: '1/2-1/2', reason: 'insufficient_material' };
+  }
+  if (chessInstance.isDraw()) {
+    return { result: '1/2-1/2', reason: 'draw' };
+  }
+  return null;
 }
 
 function handleMove(ws, payload = {}) {
@@ -338,20 +351,25 @@ function handleMove(ws, payload = {}) {
   }
 
   const { gameId, uci, playerId } = payload;
-  const lobby = LOBBIES.get(gameId);
-  if (!lobby || lobby.status !== 'active') {
-    safeSend(ws, { type: 'error', code: 'INVALID_LOBBY', msg: 'Game not found or not active' });
-    return;
-  }
-
   const player = getPlayer(ws);
   if (!player || player.playerId !== playerId) {
     safeSend(ws, { type: 'error', code: 'PLAYER_MISMATCH', msg: 'Player not recognized for move' });
     return;
   }
 
+  if (!player.gameId) {
+    safeSend(ws, { type: 'error', code: 'NOT_IN_GAME', msg: 'Player not seated in a game' });
+    return;
+  }
+
   if (player.gameId !== gameId) {
     safeSend(ws, { type: 'error', code: 'NOT_IN_GAME', msg: 'Player not seated in this game' });
+    return;
+  }
+
+  const lobby = LOBBIES.get(player.gameId);
+  if (!lobby || lobby.status !== 'active') {
+    safeSend(ws, { type: 'error', code: 'INVALID_LOBBY', msg: 'Game not found or not active' });
     return;
   }
 
@@ -398,9 +416,9 @@ function handleMove(ws, payload = {}) {
     turn: nextTurn,
   });
 
-  const gameStatus = determineGameStatus(chess);
-  if (gameStatus !== 'in_progress') {
-    finalizeGame(lobby, gameStatus.result, gameStatus.reason);
+  const outcome = determineGameOutcome(chess, moverColor);
+  if (outcome) {
+    finalizeGame(lobby, outcome.result, outcome.reason);
   }
 }
 
