@@ -46,11 +46,11 @@ function sendToPlayer(player, payload) {
   safeSend(player.ws, payload);
 }
 
-function broadcastToLobby(lobby, payload, { excludePlayerId = null } = {}) {
+function broadcastToLobby(lobby, payload, { excludePlayerId = undefined } = {}) {
   if (!lobby) return;
   [lobby.host, lobby.guest]
     .filter(Boolean)
-    .filter((player) => player.playerId !== excludePlayerId)
+    .filter((player) => excludePlayerId === undefined || player.playerId !== excludePlayerId)
     .forEach((player) => sendToPlayer(player, payload));
 }
 
