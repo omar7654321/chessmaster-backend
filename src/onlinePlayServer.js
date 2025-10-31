@@ -139,6 +139,20 @@ function finalizeGame(lobby, result, reason) {
     reason,
   });
 
+  const participants = [lobby.host, lobby.guest].filter(Boolean);
+  participants.forEach((player) => {
+    player.gameId = null;
+    player.color = null;
+    if (player.disconnectTimer) {
+      clearTimeout(player.disconnectTimer);
+      player.disconnectTimer = null;
+    }
+  });
+
+  lobby.host = null;
+  lobby.guest = null;
+  LOBBIES.delete(lobby.gameId);
+
   log.info('Game completed', { gameId: lobby.gameId, result, reason });
 }
 
@@ -148,6 +162,10 @@ function removePlayerFromLobby(player) {
   if (!lobby) {
     player.gameId = null;
     player.color = null;
+    if (player.disconnectTimer) {
+      clearTimeout(player.disconnectTimer);
+      player.disconnectTimer = null;
+    }
     return;
   }
 
@@ -160,10 +178,16 @@ function removePlayerFromLobby(player) {
 
   player.gameId = null;
   player.color = null;
+  if (player.disconnectTimer) {
+    clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = null;
+  }
 
   if (!lobby.host && !lobby.guest) {
     LOBBIES.delete(lobby.gameId);
     log.info('Lobby removed (empty)', { gameId: lobby.gameId });
+  } else {
+    lobby.status = 'waiting';
   }
 }
 
@@ -176,6 +200,10 @@ function handleHello(ws, payload = {}) {
     player.ws = ws;
     player.lastPongAt = Date.now();
     player.awaitingPong = false;
+    if (player.disconnectTimer) {
+      clearTimeout(player.disconnectTimer);
+      player.disconnectTimer = null;
+    }
     if (username) player.username = username;
     if (userId) player.userId = userId;
     ws.__playerId = player.playerId;
@@ -192,6 +220,7 @@ function handleHello(ws, payload = {}) {
       awaitingPong: false,
       gameId: null,
       color: null,
+      disconnectTimer: null,
     };
     ws.__playerId = newPlayerId;
     PLAYERS.set(newPlayerId, player);
@@ -427,6 +456,47 @@ function handleResign(ws, payload = {}) {
   finalizeGame(lobby, result, 'resign');
 }
 
+function handleLeave(ws, payload = {}) {
+  const player = getPlayer(ws);
+  if (!player) {
+    safeSend(ws, { type: 'error', code: 'NOT_IDENTIFIED', msg: 'Send hello first' });
+    return;
+  }
+
+  if (!player.gameId) {
+    safeSend(ws, { type: 'left', gameId: null });
+    return;
+  }
+
+  const lobby = LOBBIES.get(player.gameId);
+  if (!lobby) {
+    player.gameId = null;
+    player.color = null;
+    safeSend(ws, { type: 'left', gameId: null });
+    return;
+  }
+
+  const { gameId } = lobby;
+
+  if (lobby.status === 'active') {
+    const result = player.color === 'white' ? '0-1' : '1-0';
+    finalizeGame(lobby, result, 'left');
+  } else {
+    broadcastToLobby(lobby, {
+      type: 'opponent_disconnect',
+      gameId,
+      playerId: player.playerId,
+    }, { excludePlayerId: player.playerId });
+    removePlayerFromLobby(player);
+  }
+
+  safeSend(ws, {
+    type: 'left',
+    gameId,
+  });
+  log.info('Player left lobby', { playerId: player.playerId, gameId });
+}
+
 function handlePong(ws) {
   const player = getPlayer(ws);
   if (!player) return;
@@ -440,6 +510,27 @@ function handleDisconnect(ws) {
 
   player.ws = null;
   player.awaitingPong = false;
+
+  if (player.disconnectTimer) {
+    clearTimeout(player.disconnectTimer);
+  }
+
+  player.disconnectTimer = setTimeout(() => {
+    if (player.ws) return;
+    if (!player.gameId) return;
+    const lobby = LOBBIES.get(player.gameId);
+    if (!lobby) {
+      player.gameId = null;
+      player.color = null;
+      return;
+    }
+    if (lobby.status === 'active') {
+      const result = player.color === 'white' ? '0-1' : '1-0';
+      finalizeGame(lobby, result, 'disconnect_timeout');
+    } else {
+      removePlayerFromLobby(player);
+    }
+  }, 60_000);
 
   const lobby = player.gameId ? LOBBIES.get(player.gameId) : null;
   if (lobby && lobby.status === 'active') {
@@ -478,6 +569,9 @@ function handleMessage(ws, message) {
       break;
     case 'resign':
       handleResign(ws, payload);
+      break;
+    case 'leave':
+      handleLeave(ws, payload);
       break;
     case 'pong':
       handlePong(ws);
