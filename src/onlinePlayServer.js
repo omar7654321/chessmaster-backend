@@ -337,98 +337,70 @@ function handleMove(ws, payload = {}) {
     return;
   }
 
-  const player = getPlayer(ws);
-  if (!player || player.playerId !== payload.playerId) {
-    safeSend(ws, { type: 'error', code: 'NOT_IDENTIFIED', msg: 'Player mismatch' });
+  const { gameId, uci, playerId } = payload;
+  const lobby = LOBBIES.get(gameId);
+  if (!lobby || lobby.status !== 'active') {
+    safeSend(ws, { type: 'error', code: 'INVALID_LOBBY', msg: 'Game not found or not active' });
     return;
   }
 
-  const lobby = LOBBIES.get(payload.gameId);
-  if (!lobby || lobby.status === 'completed') {
-    safeSend(ws, { type: 'error', code: 'GAME_NOT_FOUND', msg: 'Game not available' });
+  const player = getPlayer(ws);
+  if (!player || player.playerId !== playerId) {
+    safeSend(ws, { type: 'error', code: 'PLAYER_MISMATCH', msg: 'Player not recognized for move' });
     return;
   }
-  if (player.gameId !== lobby.gameId) {
+
+  if (player.gameId !== gameId) {
     safeSend(ws, { type: 'error', code: 'NOT_IN_GAME', msg: 'Player not seated in this game' });
     return;
   }
-  if (!['active', 'waiting'].includes(lobby.status)) {
-    safeSend(ws, { type: 'error', code: 'GAME_INACTIVE', msg: 'Game is not active' });
-    return;
-  }
-  if (lobby.status !== 'active') {
-    safeSend(ws, { type: 'error', code: 'WAITING_OPPONENT', msg: 'Waiting for opponent to join' });
-    return;
-  }
 
-  const turnColor = lobby.chess.turn() === 'w' ? 'white' : 'black';
-  if (player.color !== turnColor) {
-    safeSend(ws, { type: 'error', code: 'NOT_YOUR_TURN', msg: 'It is not your turn' });
+  const moverColor = player.color;
+  const chess = lobby.chess;
+  const turn = chess.turn() === 'w' ? 'white' : 'black';
+  if (moverColor !== turn) {
+    safeSend(ws, { type: 'error', code: 'WRONG_TURN', msg: 'Not your turn' });
     return;
   }
 
   let moveResult = null;
   try {
-    if (payload.uci && typeof payload.uci === 'string') {
-      const normalized = payload.uci.trim().toLowerCase();
-      if (![4, 5].includes(normalized.length)) {
-        throw new Error('Invalid UCI format');
-      }
-      const moveParams = {
-        from: normalized.slice(0, 2),
-        to: normalized.slice(2, 4),
-      };
-      if (normalized.length === 5) {
-        moveParams.promotion = normalized[4];
-      }
-      moveResult = lobby.chess.move(moveParams, { sloppy: true });
-    } else if (payload.san && typeof payload.san === 'string') {
-      moveResult = lobby.chess.move(payload.san, { sloppy: true });
-    }
+    moveResult = chess.move({
+      from: uci.slice(0, 2),
+      to: uci.slice(2, 4),
+      promotion: uci.length > 4 ? uci[4] : undefined,
+    });
   } catch (err) {
     moveResult = null;
   }
 
   if (!moveResult) {
-    safeSend(ws, { type: 'error', code: 'ILLEGAL_MOVE', msg: 'Move is not legal' });
+    safeSend(ws, { type: 'error', code: 'ILLEGAL_MOVE', msg: 'Illegal move' });
     return;
   }
 
-  const fen = lobby.chess.fen();
-  const turn = lobby.chess.turn() === 'w' ? 'white' : 'black';
-  const uci = resolveUciFromMove(moveResult);
-  const san = moveResult.san;
-  const ts = new Date().toISOString();
-
-  const moveRecord = {
-    uci,
-    san,
-    from: moveResult.from,
-    to: moveResult.to,
-    fenAfter: fen,
-    ts,
+  lobby.moves.push({
     playerId: player.playerId,
-  };
+    uci,
+    fenAfter: chess.fen(),
+    timestamp: Date.now(),
+  });
 
-  lobby.moves.push(moveRecord);
+  const fenAfter = chess.fen();
+  const nextTurn = chess.turn() === 'w' ? 'white' : 'black';
 
   broadcastToLobby(lobby, {
     type: 'move',
-    gameId: lobby.gameId,
+    gameId,
+    playerId: player.playerId,
     uci,
-    san,
-    fen,
-    turn,
-    ts,
+    fen: fenAfter,
+    turn: nextTurn,
   });
 
-  if (lobby.chess.isGameOver()) {
-    const reason = determineGameOverReason(lobby.chess);
-    let result = '1/2-1/2';
-    if (reason === 'checkmate') {
-      result = player.color === 'white' ? '1-0' : '0-1';
-    }
-    finalizeGame(lobby, result, reason);
+  const gameStatus = determineGameStatus(chess);
+  if (gameStatus !== 'in_progress') {
+    finalizeGame(lobby, gameStatus.result, gameStatus.reason);
   }
 }
 
